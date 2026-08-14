@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  spark-master:
+    build: .
+    image: sdv-spark:latest
+    container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+
+  spark-worker:
+    image: sdv-spark:latest
+    container_name: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+
+  test-runner:
+    image: sdv-spark:latest
+    container_name: test-runner
+    user: root
+    environment:
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    volumes:
+      - .:/app
+      - /app/.venv  # Mask host virtualenv to prevent binary conflicts
+    working_dir: /app
+    entrypoint: python3 test_czech_financial_spark.py
+    depends_on:
+      - spark-master
+      - spark-worker
