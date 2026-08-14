@@ -253,33 +253,6 @@ class CopulaGANSynthesizer(CTGANSynthesizer):
         sampled = super()._sample(num_rows, conditions)
         return self._gaussian_normalizer_hyper_transformer.reverse_transform(sampled)
 
-    def _sample_spark(self, num_rows, max_tries_per_batch=100, batch_size=None, output_file_path=None, keep_extra_columns=False):
-        """Distributed-aware sampling for CopulaGAN.
-
-        CTGAN's PyTorch model cannot run inside Spark forked workers (libtorch conflict).
-        Generate on driver (fast for tabular GAN) and wrap as Spark DataFrame.
-        ponytail: for truly large num_rows, upgrade to chunked generation + repartition.
-        """
-        # Generate on driver: GN-space → DP-space → original (pandas path)
-        pdf = self._model.sample(num_rows)
-        pdf = self._gaussian_normalizer_hyper_transformer.reverse_transform(pdf)
-        pdf = self._data_processor._data_processor.reverse_transform(pdf)
-
-        # Assign globally unique PK if needed
-        pk_col = None
-        table_meta = self.metadata.tables.get(self._table_name)
-        if table_meta is not None:
-            pk = getattr(table_meta, 'primary_key', None)
-            if pk and table_meta.columns.get(pk, {}).get('sdtype', '') == 'id':
-                pk_col = pk
-
-        spark = SparkSession.builder.getOrCreate()
-        spark_df = spark.createDataFrame(pdf)
-        if pk_col and pk_col in spark_df.columns:
-            spark_df = spark_df.withColumn(pk_col, F.monotonically_increasing_id())
-        return spark_df
-
-
 
     def get_learned_distributions(self):
         """Get the marginal distributions used by the ``CTGANSynthesizer``.
