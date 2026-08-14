@@ -81,6 +81,14 @@ A mudança na API voltada ao usuário é **zero** — os mesmos métodos `fit()`
 
 20. Como engenheiro de plataforma, quero que o harness de teste suporte configurar o master Spark via variável de ambiente `SPARK_MASTER_URL`, para que o mesmo script de teste funcione em modo local, Docker e clusters remotos.
 
+21. Como cientista de dados, quero que o `GaussianCopulaSynthesizer` aceite PySpark DataFrames no `fit()` e retorne PySpark DataFrames no `sample()`, para que copulas gaussianas possam ser treinadas e amostradas no ecossistema Spark sem converter dados para pandas manualmente.
+
+22. Como cientista de dados, quero que o `CopulaGANSynthesizer` aceite PySpark DataFrames no `fit()` e retorne PySpark DataFrames no `sample()`, para aproveitar o pipeline híbrido (normalização estatística + GAN) em datasets Spark sem mudança de API.
+
+23. Como engenheiro de dados, quero que colunas de chave primária do tipo `id` sejam geradas com `monotonically_increasing_id()` após a amostragem distribuída, para garantir unicidade global sem coordenação entre workers Spark.
+
+24. Como engenheiro de plataforma, quero que a contagem de linhas por partição em `mapInPandas` some o comprimento dos batches pandas (não o número de batches), para que partições com poucos dados — onde um único batch contém todas as linhas — gerem o número correto de linhas sintéticas.
+
 ---
 
 ## Decisões de Implementação
@@ -134,6 +142,16 @@ O método `_sample_spark` em `BaseHierarchicalSampler`:
 4. Quando `keep_extra_columns=True`, colunas presentes na saída do modelo mas ausentes da saída do reverse-transform são preservadas (colunas de extensão HMA)
 5. Seeds aleatórias em cada partição derivam de `time.time() * 1000` para garantir linhas sintéticas únicas entre partições
 
+**Correção de bug crítico — contagem de linhas por partição**: a implementação original usava `sum(1 for _ in iterator)` para contar linhas, o que contava **batches** (iterações do iterator), não linhas. O iterator do `mapInPandas` produz um pandas DataFrame por batch — com datasets pequenos (`num_rows < 100K`), cada partição recebe exatamente 1 batch com N linhas, resultando em `count = 1` e `model.sample(1)` gerando apenas 1 linha por partição em vez de N. A correção usa `sum(len(b) for b in iterator)` para somar o número de linhas em todos os batches.
+
+**Colisão de IDs — solução definitiva**: colunas de chave primária do tipo `id` são geridas pelo `AnonymizedFaker(cardinality_rule='unique')` no DataProcessor. Esse transformer mantém um pool fixo de IDs únicos computados durante o `fit`. Quando o objeto é broadcastado para workers e cada worker tenta gerar IDs do mesmo pool congelado, ocorrem colisões → descarte de linhas. A solução adotada:
+
+1. A coluna PK é detectada no driver antes do `mapInPandas` (via `metadata.tables[table_name].primary_key` + `sdtype == 'id'`)
+2. A PK é excluída do schema inferido e removida do output de cada worker dentro de `sample_partition`
+3. Após o `mapInPandas`, a coluna PK é re-adicionada com `F.monotonically_increasing_id()` — garantia de unicidade global sem coordenação entre workers
+
+**Limitação PyTorch em workers Spark forked**: modelos CTGAN e TVAE contêm tensores PyTorch que não podem ser desserializados em processos workers Spark forked (conflito de libtorch com o processo fork). Tentar executar `model.sample()` dentro de um worker Spark via `mapInPandas` resulta em crash silencioso do worker (`Connection reset`, `EOFException`). Esta limitação é estrutural — não é um bug da implementação. Ela afeta qualquer tentativa de distribuir a amostragem PyTorch via `mapInPandas`. Para modelos PyTorch (CTGAN, TVAE, CopulaGAN), a amostragem ocorre no driver.
+
 ### Treinamento Distribuído CTGAN/TVAE
 
 Uma função `_fit_spark_pytorch` a nível de módulo:
@@ -144,6 +162,21 @@ Uma função `_fit_spark_pytorch` a nível de módulo:
 4. Rank 0 salva o modelo via `torch.save`; o driver carrega de volta
 
 > **Nota**: Este é um caminho protótipo. O treinamento em si ainda não é DDP-paralelo — cada processo do TorchDistributor treina independentemente. O caminho de upgrade é envolver CTGAN/TVAE em `DistributedDataParallel`.
+
+### GaussianCopulaSynthesizer no Spark
+
+O `GaussianCopulaSynthesizer._fit` detecta Spark DataFrames e os coleta para pandas no driver antes de ajustar o `GaussianMultivariate` (da biblioteca `copulas`, que depende de scipy/numpy e não pode rodar distribuído). A coleta é **inevitável** para copulas estatísticas: o `GaussianMultivariate.fit()` exige o dataset completo para computar a matriz de correlação de Spearman e distribuições marginais. Copulas são extremamente rápidas mesmo com milhões de linhas — a coleta não é um gargalo prático.
+
+A amostragem usa `_sample_spark` herdado do `BaseSingleTableSynthesizer`, que distribui via `mapInPandas` (o `GaussianMultivariate` serializa corretamente para broadcast).
+
+### CopulaGANSynthesizer no Spark
+
+O `CopulaGANSynthesizer` implementa um pipeline em dois estágios:
+
+1. **Normalização gaussiana** (`GaussianNormalizer` via `HyperTransformer` do RDT): ajusta distribuições scipy por coluna. É pandas-only — Spark DF é coletado para pandas no driver antes deste estágio.
+2. **CTGAN**: treina sobre dados normalizados (já pandas). O `super()._fit()` recebe pandas e treina localmente (não via TorchDistributor, pois o dado já está no driver).
+
+Para amostragem, `_sample_spark` é sobrescrito: gera no driver via `model.sample()` → `GN.reverse_transform()` → `DataProcessor.reverse_transform()` (cadeia completa GN-space → DP-space → original), depois empacota como Spark DF via `spark.createDataFrame()`. Tentar distribuir o `model.sample()` do CTGAN em workers via `mapInPandas` resulta em crash do worker Python (limitação PyTorch-in-fork descrita acima).
 
 ### Enforcement de Tamanho de Tabela no Spark
 
@@ -206,9 +239,13 @@ A suíte de testes existente do SDV usa pytest com fixtures pandas. O teste de i
 - **Treinamento DDP-paralelo de CTGAN/TVAE**: A integração com `TorchDistributor` é um protótipo que treina em um único processo. Treinamento verdadeiramente distribuído com data-parallel requer envolver o modelo em `DistributedDataParallel` e particionar batches de treinamento entre workers.
 - **Spark Connect / Databricks Connect**: A implementação atual usa `SparkSession` clássico com variáveis broadcast. Spark Connect (serverless) tem restrições de serialização diferentes.
 - **Streaming / fit incremental**: O pipeline assume processamento batch. Integração com Structured Streaming não é abordada.
-- **Enforcement de unicidade de chave primária**: Tabelas raiz amostradas podem produzir chaves primárias duplicadas. O caminho de upgrade é usar `monotonically_increasing_id()` ou um gerador de chaves customizado.
-- **Colisão de chaves baseadas em sequência**: `reverse_transform` com `reset_keys=True` usa geração de ID baseada em sequência que pode colidir entre partições. O caminho de upgrade é coordenação de offset ou geração de ID nativa do Spark.
-- **Testes unitários para métodos Spark individuais**: Apenas testes de integração end-to-end são fornecidos. Testes unitários isolados para `SparkDataProcessor`, `_get_extension_spark`, etc. são adiados.
+- **Enforcement de unicidade de chave primária**: ~~Tabelas raiz amostradas podem produzir chaves primárias duplicadas.~~ **Resolvido**: a coluna PK `id` é agora removida dos workers e re-adicionada com `monotonically_increasing_id()` após `mapInPandas`, garantindo unicidade global.
+- **Colisão de chaves baseadas em sequência**: ~~`reverse_transform` com `reset_keys=True` usa geração de ID baseada em sequência que pode colidir entre partições.~~ **Resolvido**: a solução de strip-e-reatribuição resolve o problema para PKs do tipo `id`. Outros tipos de PK podem ainda exigir tratamento específico.
+- **Treinamento DDP-paralelo de CTGAN/TVAE**: A integração com `TorchDistributor` é um protótipo que treina em um único processo. Treinamento verdadeiramente distribuído com data-parallel requer envolver o modelo em `DistributedDataParallel` e particionar batches de treinamento entre workers.
+- **Spark Connect / Databricks Connect**: A implementação atual usa `SparkSession` clássico com variáveis broadcast. Spark Connect (serverless) tem restrições de serialização diferentes.
+- **Streaming / fit incremental**: O pipeline assume processamento batch. Integração com Structured Streaming não é abordada.
+- **Testes unitários para métodos Spark individuais**: Apenas testes de integração end-to-end são fornecidos para o pipeline HMA. Testes unitários isolados para `SparkDataProcessor`, `_get_extension_spark`, etc. são adiados.
+- **PARSynthesizer no Spark**: Bloqueio estrutural — `PARSynthesizer` herda de `BaseSynthesizer` (não de `BaseSingleTableSynthesizer`) com `fit()` completamente sobrescrito sem rota `_spark_mode`. O pipeline opera sequencialmente por entidade (groupby + iteração por `sequence_key`), incompatível com `mapInPandas`. O `deepecho.PARModel` (LSTM externa) não suporta `TorchDistributor` sem reescrita completa. Fora de escopo desta fase.
 - **Integração com catálogo Spark SQL**: Tabelas sintéticas são retornadas como DataFrames em memória, não registradas em Hive metastore ou Unity Catalog.
 
 ---
@@ -226,7 +263,18 @@ A suíte de testes existente do SDV usa pytest com fixtures pandas. O teste de i
 | Amostragem de tabela filha | `groupBy(parent_key).applyInPandas` — nível de linha pai |
 | Reverse transform | `mapInPandas` — nível de partição |
 
-### Arquivos Alterados (8 arquivos, +649 / -8 linhas)
+### Compatibilidade Spark por Algoritmo
+
+| Algoritmo | Fit Spark | Sample Spark | Estratégia |
+|-----------|-----------|--------------|------------|
+| `GaussianCopulaSynthesizer` | ✅ collect driver | ✅ `mapInPandas` distribuído | Copula é scipy/numpy — collect inevitável; sample distribui normalmente |
+| `CTGANSynthesizer` | ✅ `TorchDistributor` | ✅ driver + `createDataFrame` | PyTorch não roda em workers forked; sample rápido no driver |
+| `TVAESynthesizer` | ✅ `TorchDistributor` | ✅ driver + `createDataFrame` | Mesma limitação PyTorch do CTGAN |
+| `CopulaGANSynthesizer` | ✅ collect driver | ✅ driver + `createDataFrame` | GaussianNormalizer (pandas-only) + PyTorch — ambos exigem driver |
+| `HMASynthesizer` | ✅ distribuído | ✅ distribuído | Pipeline completo distribuído; usa sintetizador single-table internamente |
+| `PARSynthesizer` | ❌ bloqueio estrutural | ❌ | LSTM sequencial por entidade; incompatível com workers Spark paralelos |
+
+### Arquivos Alterados (10 arquivos)
 
 | Arquivo | Tipo de Mudança | Propósito |
 |---------|----------------|-----------|
@@ -236,8 +284,10 @@ A suíte de testes existente do SDV usa pytest com fixtures pandas. O teste de i
 | `sdv/multi_table/base.py` | Modificado | Adicionou despacho `_fit_spark`, `_preprocess_spark`; `sample()` com awareness Spark |
 | `sdv/multi_table/hma.py` | Modificado | Adicionou `_augment_table_spark`, `_get_extension_spark`; `_augment_tables` e `_pop_foreign_keys` com awareness Spark |
 | `sdv/sampling/hierarchical_sampler.py` | Modificado | Adicionou `_sample_spark`, `_sample_children_spark`, `_enforce_table_size_spark`, `_finalize_spark` |
-| `sdv/single_table/base.py` | Modificado | Adicionou `_fit_spark`, `_preprocess_spark`, `_sample_spark` com suporte a `keep_extra_columns` |
+| `sdv/single_table/base.py` | Modificado | Adicionou `_fit_spark`, `_preprocess_spark`, `_sample_spark` com suporte a `keep_extra_columns`; correção do bug de count por batch; lógica de strip-e-reatribuição de PK id |
 | `sdv/single_table/ctgan.py` | Modificado | Adicionou `_fit_spark_pytorch` para CTGAN/TVAE via `TorchDistributor` |
+| `sdv/single_table/copulas.py` | Modificado | Adicionou detecção Spark em `_fit`: collect para pandas antes do `GaussianMultivariate.fit()` |
+| `sdv/single_table/copulagan.py` | Modificado | Adicionou detecção Spark em `_fit` (collect para GaussianNormalizer) e `_sample_spark` (geração no driver, empacotamento como Spark DF) |
 
 ### Tetos Conhecidos (notas ponytail no código)
 
@@ -245,3 +295,5 @@ A suíte de testes existente do SDV usa pytest com fixtures pandas. O teste de i
 - **`row_number()` com `orderBy(lit(0))`**: Ordenação não-determinística dentro de partições. Upgrade: usar uma chave de ordenação determinística.
 - **Seed aleatória de `time.time()`**: Adequada para unicidade mas não reprodutível. Upgrade: derivação de seed com awareness de partição a partir de uma master seed fornecida pelo usuário.
 - **Amostra do driver para pré-processamento**: 10K linhas podem não capturar todos os valores categóricos em colunas com alta cardinalidade. Upgrade: coletar valores distintos por coluna antes do fitting.
+- **CopulaGAN sample no driver**: `model.sample()` do CTGAN não é seguro em workers Spark forked (libtorch conflict). Para `num_rows` muito grandes (>10M), o driver pode ser o gargalo. Upgrade: chunked generation com repartition posterior, ou substituir por um backend de geração tabular que serialize corretamente para Spark.
+- **`monotonically_increasing_id()` não é sequencial**: Os IDs gerados são únicos globalmente mas não sequenciais (ex: 0, 8589934592). Upgrade: `row_number()` sobre uma partition column para IDs estritamente sequenciais.
