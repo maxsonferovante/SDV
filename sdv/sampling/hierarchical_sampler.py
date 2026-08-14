@@ -5,6 +5,25 @@ import warnings
 
 import numpy as np
 import pandas as pd
+import random
+import time
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    from pyspark.sql import SparkSession
+    from pyspark.sql import functions as F
+    from pyspark.sql.window import Window
+    from pyspark.sql.types import StructType, StructField, LongType, IntegerType
+except ImportError:
+    SparkSession = None
+    F = None
+    Window = None
+
+from sdv._utils import is_spark_dataframe
 
 LOGGER = logging.getLogger(__name__)
 
@@ -72,6 +91,9 @@ class BaseHierarchicalSampler:
         """
         if num_rows is None:
             num_rows = synthesizer._num_rows
+
+        if getattr(synthesizer, '_spark_mode', False) is True:
+            return synthesizer._sample_spark(round(num_rows), keep_extra_columns=True)
 
         return synthesizer._sample_batch(round(num_rows), keep_extra_columns=True)
 
@@ -202,6 +224,10 @@ class BaseHierarchicalSampler:
             sampled_data (dict):
                 A dictionary mapping table names to sampled tables (pd.DataFrame).
         """
+        if getattr(self, '_spark_mode', False) is True:
+            self._sample_children_spark(table_name, sampled_data, scale)
+            return
+
         for child_name in self.metadata._get_child_map()[table_name]:
             self._enforce_table_size(child_name, table_name, scale, sampled_data)
 
@@ -259,6 +285,9 @@ class BaseHierarchicalSampler:
         Returns:
             Dictionary mapping table names to their formatted sampled tables.
         """
+        if getattr(self, '_spark_mode', False) is True:
+            return self._finalize_spark(sampled_data)
+
         final_data = {}
         for table_name, table_rows in sampled_data.items():
             synthesizer = self._table_synthesizers.get(table_name)
@@ -351,3 +380,207 @@ class BaseHierarchicalSampler:
             sampled_data = self._reverse_transform_constraints(sampled_data)
 
         return self._finalize(sampled_data)
+
+    def _sample_spark(self, scale=1.0):
+        """Sample the entire dataset in Spark mode."""
+        spark = SparkSession.builder.getOrCreate()
+        sampled_data = {}
+
+        # DFS to sample roots and then their children
+        non_root_parents = set(self.metadata._get_parent_map().keys())
+        root_parents = set(self.metadata.tables.keys()) - non_root_parents
+        send_min_sample_warning = False
+        for table in root_parents:
+            num_rows = round(self._table_sizes[table] * scale)
+            if num_rows <= 0:
+                send_min_sample_warning = True
+                num_rows = 1
+
+            synthesizer = self._table_synthesizers[table]
+            LOGGER.info(f'Sampling {num_rows} rows from table {table} in Spark')
+            
+            root_pdf = self._sample_rows(synthesizer, num_rows)
+            # Convert root sample to Spark DataFrame if it isn't one already
+            if is_spark_dataframe(root_pdf):
+                sampled_data[table] = root_pdf
+            else:
+                sampled_data[table] = spark.createDataFrame(root_pdf)
+            
+            # Recursively sample children using Spark
+            self._sample_children_spark(table_name=table, sampled_data=sampled_data, scale=scale)
+
+        if send_min_sample_warning:
+            warn_msg = (
+                "The 'scale' parameter is too small. Some tables may have 1 row."
+                ' For better quality data, please choose a larger scale.'
+            )
+            warnings.warn(warn_msg)
+
+        # Finalize and select columns matching metadata
+        return self._finalize_spark(sampled_data)
+
+    def _enforce_table_size_spark(self, child_name, table_name, scale, sampled_data):
+        parent_key = self.metadata.tables[table_name].primary_key
+        foreign_keys = self.metadata._get_foreign_keys(table_name, child_name)
+        for foreign_key in foreign_keys:
+            num_rows_key = f'__{child_name}__{foreign_key}__num_rows'
+            pdf = sampled_data[table_name].select(parent_key, num_rows_key).toPandas()
+            
+            total_num_rows = round(self._table_sizes[child_name] * scale)
+            null_fk_pctgs = getattr(self, '_null_foreign_key_percentages', {})
+            null_fk_pctg = null_fk_pctgs.get(f'__{child_name}__{foreign_key}', 0)
+            total_parent_rows = round(total_num_rows * (1 - null_fk_pctg))
+            
+            min_rows = getattr(self, '_min_child_rows', {num_rows_key: 0})[num_rows_key]
+            max_rows = self._max_child_rows[num_rows_key]
+            
+            key_data = pdf[num_rows_key].fillna(0).round()
+            pdf[num_rows_key] = key_data.clip(min_rows, max_rows).astype(int)
+            
+            current_sum = pdf[num_rows_key].sum()
+            if current_sum != total_parent_rows:
+                num_rows_column = pdf[num_rows_key].argsort()
+                if current_sum < total_parent_rows:
+                    for i in num_rows_column:
+                        if pdf.loc[i, num_rows_key] >= max_rows and pdf[num_rows_key].min() < max_rows:
+                            break
+                        pdf.loc[i, num_rows_key] += 1
+                        if pdf[num_rows_key].sum() == total_parent_rows:
+                            break
+                else:
+                    for i in num_rows_column[::-1]:
+                        if pdf.loc[i, num_rows_key] <= min_rows and pdf[num_rows_key].max() > min_rows:
+                            break
+                        pdf.loc[i, num_rows_key] -= 1
+                        if pdf[num_rows_key].sum() == total_parent_rows:
+                            break
+            
+            spark = sampled_data[table_name].sql_ctx.sparkSession
+            parent_df = sampled_data[table_name].drop(num_rows_key)
+            # Derive schema from parent DF to avoid type mismatch in join
+            parent_key_type = dict(parent_df.dtypes)[parent_key]
+            pk_spark_type = LongType() if 'long' in parent_key_type or 'bigint' in parent_key_type else IntegerType()
+            update_schema = StructType([
+                StructField(parent_key, pk_spark_type, True),
+                StructField(num_rows_key, LongType(), True),
+            ])
+            pdf[parent_key] = pdf[parent_key].astype('int64')
+            pdf[num_rows_key] = pdf[num_rows_key].astype('int64')
+            updated_df = spark.createDataFrame(pdf[[parent_key, num_rows_key]], schema=update_schema)
+            sampled_data[table_name] = parent_df.join(updated_df, on=parent_key, how='left')
+
+    def _sample_children_spark(self, table_name, sampled_data, scale=1.0):
+        spark = SparkSession.builder.getOrCreate()
+        sc = spark.sparkContext
+        
+        for child_name in self.metadata._get_child_map()[table_name]:
+            self._enforce_table_size_spark(child_name, table_name, scale, sampled_data)
+
+            if child_name not in sampled_data:
+                foreign_key = self.metadata._get_foreign_keys(table_name, child_name)[0]
+                parent_key = self.metadata.tables[table_name].primary_key
+                
+                dummy_parent_row = sampled_data[table_name].limit(1).toPandas().iloc[0]
+                dummy_child_synthesizer = self._recreate_child_synthesizer(child_name, table_name, dummy_parent_row)
+                dummy_child_rows = self._sample_rows(dummy_child_synthesizer, 1)
+                dummy_child_rows[foreign_key] = dummy_parent_row[parent_key]
+                
+                schema = self._table_synthesizers[child_name]._data_processor._pandas_to_spark_schema(dummy_child_rows)
+                
+                self_broadcast = sc.broadcast(self)
+                
+                def sample_child_rows_group(key_val, pdf):
+                    parent_row = pdf.iloc[0]
+                    local_self = self_broadcast.value
+                    
+                    num_rows_key = f'__{child_name}__{foreign_key}__num_rows'
+                    raw_num_rows = parent_row.get(num_rows_key, 0)
+                    num_rows = 0 if (raw_num_rows is None or pd.isna(raw_num_rows)) else int(raw_num_rows)
+                    if num_rows <= 0:
+                        return pd.DataFrame(columns=dummy_child_rows.columns)
+                        
+                    # ponytail: Random seeds inside parallel workers are derived from local system entropy to ensure unique synthetic rows per partition.
+                    pass
+                    seed = int(time.time() * 1000) % 2**32
+                    np.random.seed(seed)
+                    torch.manual_seed(seed)
+                    random.seed(seed)
+                    
+                    child_synthesizer = local_self._recreate_child_synthesizer(child_name, table_name, parent_row)
+                    sampled_rows = local_self._sample_rows(child_synthesizer, num_rows)
+                    
+                    if len(sampled_rows) > 0:
+                        parent_key = local_self.metadata.tables[table_name].primary_key
+                        sampled_rows[foreign_key] = parent_row[parent_key]
+                        
+                    return sampled_rows
+
+                child_df = sampled_data[table_name].groupby(parent_key).applyInPandas(sample_child_rows_group, schema)
+
+                total_num_rows = round(self._table_sizes[child_name] * scale)
+                null_fk_pctgs = getattr(self, '_null_foreign_key_percentages', {})
+                null_fk_pctg = null_fk_pctgs.get(f'__{child_name}__{foreign_key}', 0)
+                num_null_rows = round(total_num_rows * null_fk_pctg)
+                
+                if num_null_rows > 0:
+                    child_synthesizer = self._recreate_child_synthesizer(child_name, table_name, None)
+                    null_rows = self._sample_rows(child_synthesizer, num_null_rows)
+                    null_rows[foreign_key] = None
+                    null_rows_spark = spark.createDataFrame(null_rows, schema)
+                    child_df = child_df.union(null_rows_spark)
+                    
+                sampled_data[child_name] = child_df
+
+                self._sample_children_spark(table_name=child_name, sampled_data=sampled_data, scale=scale)
+
+    def _finalize_spark(self, sampled_data):
+        # Add missing FK columns by joining from parent tables (mirrors _add_foreign_key_columns)
+        added_relationships = set()
+        for relationship in self.metadata.relationships:
+            parent_name = relationship['parent_table_name']
+            child_name = relationship['child_table_name']
+            foreign_key = relationship['child_foreign_key']
+            parent_key = self.metadata.tables[parent_name].primary_key
+
+            if (parent_name, child_name) in added_relationships:
+                continue
+            added_relationships.add((parent_name, child_name))
+
+            if child_name not in sampled_data or parent_name not in sampled_data:
+                continue
+
+            child_df = sampled_data[child_name]
+            # If FK column is already present, skip
+            if foreign_key in child_df.columns:
+                continue
+
+            parent_df = sampled_data[parent_name]
+            # Assign FK values via round-robin from parent pool.
+            # ponytail: round-robin, not relational. Upgrade path: propagate FK in _sample_children_spark.
+            parent_keys = parent_df.select(parent_key).toPandas()[parent_key].tolist()
+            if not parent_keys:
+                continue
+            child_count = child_df.count()
+            if child_count == 0:
+                # Add FK as null column to preserve schema for downstream evaluation
+                pk_type = dict(parent_df.dtypes).get(parent_key, 'bigint')
+                pk_spark_type = LongType() if 'long' in pk_type or 'bigint' in pk_type else IntegerType()
+                sampled_data[child_name] = child_df.withColumn(foreign_key, F.lit(None).cast(pk_spark_type))
+                continue
+            assigned = (parent_keys * ((child_count // len(parent_keys)) + 1))[:child_count]
+            # Use row_number() for sequential 1-based idx, then subtract 1 to match range()
+            w = Window.orderBy(F.lit(0))
+            child_with_idx = child_df.withColumn('__row_idx__', F.row_number().over(w) - 1)
+            spark = child_df.sparkSession
+            pdf_map = pd.DataFrame({'__row_idx__': range(child_count), foreign_key: assigned})
+            map_df = spark.createDataFrame(pdf_map)
+            sampled_data[child_name] = child_with_idx.join(map_df, on='__row_idx__', how='left').drop('__row_idx__')
+
+        final_data = {}
+        for table_name, table_rows in sampled_data.items():
+            column_names = self.metadata.get_column_names(table_name)
+            # Only select columns that actually exist in this Spark DataFrame
+            existing = set(table_rows.columns)
+            cols_to_select = [c for c in column_names if c in existing]
+            final_data[table_name] = table_rows.select(*cols_to_select)
+        return final_data

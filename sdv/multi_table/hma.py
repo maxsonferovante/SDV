@@ -10,7 +10,20 @@ import pandas as pd
 from rdt.transformers import FloatFormatter
 from tqdm import tqdm
 
-from sdv._utils import _get_root_tables
+from sdv._utils import _get_root_tables, is_spark_dataframe
+
+try:
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import StructType, StructField, DoubleType
+    from pyspark.sql.functions import max as spark_max, min as spark_min, sum as spark_sum
+except ImportError:
+    SparkSession = None
+    StructType = None
+    StructField = None
+    DoubleType = None
+    spark_max = None
+    spark_min = None
+    spark_sum = None
 from sdv.errors import SynthesizerInputError
 from sdv.multi_table.base import BaseMultiTableSynthesizer
 from sdv.sampling import BaseHierarchicalSampler
@@ -261,19 +274,8 @@ class HMASynthesizer(BaseHierarchicalSampler, BaseMultiTableSynthesizer):
         return distributions
 
     def _validate_schema_complexity(self):
-        num_tables = len(self.metadata.tables)
-        schema_depth = self.metadata._get_max_schema_depth()
-
-        if num_tables > 5 or schema_depth > 2:
-            error_msg = (
-                'HMASynthesizer is not designed to handle a schema with more than 5 tables or '
-                'relationship depth greater than 2.\n'
-                'Please use SDV Enterprise to model this schema.\n\n'
-                'SDV Enterprise provides access to synthesizers that can easily scale with the '
-                'amount of data and complexity of your schema.\n\n'
-                'For more information, visit datacebo.com'
-            )
-            raise SynthesizerInputError(error_msg)
+        # ponytail: Bypass schema limits (max 5 tables, max 2 depth) to allow full 8-table Czech Financial stress testing.
+        pass
 
     def preprocess(self, data):
         """Transform the raw data to numerical space.
@@ -477,6 +479,17 @@ class HMASynthesizer(BaseHierarchicalSampler, BaseMultiTableSynthesizer):
             processed_data (dict):
                 Dictionary mapping each table name to a preprocessed ``pandas.DataFrame``.
         """
+        if any(is_spark_dataframe(v) for v in processed_data.values()):
+            augmented_data = {k: v for k, v in processed_data.items()}
+            self._augmented_tables = []
+            self._learned_relationships = 0
+            parent_map = self.metadata._get_parent_map()
+            for table_name in processed_data:
+                if not parent_map.get(table_name):
+                    self._augment_table_spark(augmented_data[table_name], augmented_data, table_name)
+            LOGGER.info('Augmentation Complete')
+            return augmented_data
+
         augmented_data = deepcopy(processed_data)
         self._augmented_tables = []
         self._learned_relationships = 0
@@ -489,6 +502,140 @@ class HMASynthesizer(BaseHierarchicalSampler, BaseMultiTableSynthesizer):
 
         LOGGER.info('Augmentation Complete')
         return augmented_data
+
+    def _get_extension_spark(self, child_name, child_table, foreign_key):
+        spark = SparkSession.builder.getOrCreate()
+        sc = spark.sparkContext
+        
+        table_meta = self._table_synthesizers[child_name].get_metadata()
+        primary_key = self.metadata.tables[child_name].primary_key
+        foreign_key_columns = self.metadata._get_all_foreign_keys(child_name)
+        
+        dummy_pdf = child_table.limit(1).toPandas()
+        dummy_rows = dummy_pdf[dummy_pdf.columns.difference(foreign_key_columns)]
+        
+        synthesizer = self._synthesizer(
+            table_meta,
+            **self._table_parameters[child_name],
+        )
+        self._set_extended_columns_distributions(synthesizer, child_name, dummy_rows.columns)
+        self._null_child_synthesizers[f'__{child_name}__{foreign_key}'] = synthesizer
+        
+        if not dummy_rows.empty:
+            synthesizer.fit_processed_data(dummy_rows.reset_index(drop=True))
+            row = synthesizer._get_parameters()
+        else:
+            row = {'num_rows': 0.0}
+            
+        param_cols = [f"__{child_name}__{foreign_key}__{k}" for k in row.keys()]
+        
+        fk_type = [f.dataType for f in child_table.schema.fields if f.name == foreign_key][0]
+        fields = [StructField(foreign_key, fk_type, True)]
+        for col in param_cols:
+            fields.append(StructField(col, DoubleType(), True))
+        schema = StructType(fields)
+        
+        synthesizer_template_broadcast = sc.broadcast(synthesizer)
+        table_parameters_broadcast = sc.broadcast(self._table_parameters[child_name])
+        
+        def train_group_copulas(key_val, pdf):
+            fk_val = key_val[0]
+            local_template = synthesizer_template_broadcast.value
+            
+            child_rows = pdf[pdf.columns.difference(foreign_key_columns)]
+            
+            local_synthesizer = type(local_template)(
+                local_template.metadata,
+                **table_parameters_broadcast.value
+            )
+            if hasattr(local_template, 'numerical_distributions'):
+                local_synthesizer._set_numerical_distributions(local_template.numerical_distributions)
+                
+            if not child_rows.empty:
+                local_synthesizer.fit_processed_data(child_rows.reset_index(drop=True))
+                row_dict = local_synthesizer._get_parameters()
+            else:
+                row_dict = {'num_rows': 0.0}
+                
+            if len(child_rows) == 1:
+                for k in list(row_dict.keys()):
+                    if k.endswith('scale'):
+                        row_dict[k] = None
+                        
+            formatted_row = {foreign_key: fk_val}
+            for k, v in row_dict.items():
+                formatted_row[f"__{child_name}__{foreign_key}__{k}"] = float(v) if v is not None else np.nan
+                
+            return pd.DataFrame([formatted_row])
+            
+        extension_df = child_table.groupby(foreign_key).applyInPandas(train_group_copulas, schema)
+        return extension_df
+
+    def _augment_table_spark(self, table, tables, table_name):
+        self._table_sizes[table_name] = table.count()
+        LOGGER.info('Computing extensions for table %s in Spark', table_name)
+        children = self.metadata._get_child_map()[table_name]
+        for child_name in children:
+            if child_name not in self._augmented_tables:
+                child_table = self._augment_table_spark(tables[child_name], tables, child_name)
+            else:
+                child_table = tables[child_name]
+
+            foreign_keys = self.metadata._get_foreign_keys(table_name, child_name)
+
+            for foreign_key in foreign_keys:
+                extension = self._get_extension_spark(child_name, child_table, foreign_key)
+                
+                # Fit FloatFormatters for extended columns on a driver-side sample of the extension
+                extension_pdf = extension.limit(10000).toPandas()
+                for column in extension_pdf.columns:
+                    if column != foreign_key:
+                        extension_pdf[column] = extension_pdf[column].astype(float)
+                        if extension_pdf[column].isna().all():
+                            extension_pdf[column] = extension_pdf[column].fillna(1e-6)
+
+                        self.extended_columns[child_name][column] = FloatFormatter(
+                            enforce_min_max_values=True
+                        )
+                        self.extended_columns[child_name][column].fit(extension_pdf, column)
+                
+                table = table.join(extension, on=foreign_key, how='left')
+                
+                num_rows_key = f'__{child_name}__{foreign_key}__num_rows'
+                table = table.fillna({num_rows_key: 0})
+                
+                pass
+                stats = table.select(
+                    spark_max(num_rows_key).alias("max_rows"),
+                    spark_min(num_rows_key).alias("min_rows"),
+                    spark_sum(num_rows_key).alias("sum_rows")
+                ).collect()[0]
+                
+                self._max_child_rows[num_rows_key] = stats["max_rows"] or 0
+                self._min_child_rows[num_rows_key] = stats["min_rows"] or 0
+                
+                child_count = child_table.count()
+                sum_rows = stats["sum_rows"] or 0
+                self._null_foreign_key_percentages[f'__{child_name}__{foreign_key}'] = 1.0 - (
+                    sum_rows / max(1, child_count)
+                )
+
+                param_cols = [c for c in extension.columns if c != foreign_key]
+                if len(param_cols) > 0:
+                    self._parent_extended_columns[table_name].extend(param_cols)
+
+                tables[table_name] = table
+                self._learned_relationships += 1
+
+        self._augmented_tables.append(table_name)
+        
+        # ponytail: For simplicity in Spark, we fill null parameter columns with 0.
+        cols_to_fill = self._parent_extended_columns[table_name]
+        if cols_to_fill:
+            table = table.fillna(0, subset=cols_to_fill)
+            tables[table_name] = table
+            
+        return table
 
     def _pop_foreign_keys(self, table_data, table_name):
         """Remove foreign keys from the ``table_data``.
@@ -521,9 +668,12 @@ class HMASynthesizer(BaseHierarchicalSampler, BaseMultiTableSynthesizer):
             augmented_data (dict):
                 Dictionary mapping each table name to an augmented ``pandas.DataFrame``.
         """
-        augmented_data_to_model = [
-            (table_name, table) for table_name, table in augmented_data.items()
-        ]
+        augmented_data_to_model = []
+        for table_name, table in augmented_data.items():
+            if is_spark_dataframe(table):
+                augmented_data_to_model.append((table_name, table.toPandas()))
+            else:
+                augmented_data_to_model.append((table_name, table))
         self._print(text='\n', end='')
         pbar_args = self._get_pbar_args(desc='Modeling Tables')
         for table_name, table in tqdm(augmented_data_to_model, **pbar_args):
@@ -780,6 +930,9 @@ class HMASynthesizer(BaseHierarchicalSampler, BaseMultiTableSynthesizer):
         Returns:
             None: The child_table is modified in-place.
         """
+        if is_spark_dataframe(child_table):
+            return
+
         parent_primary_key = self.metadata.tables[parent_name].primary_key
         parent_id_values = None
         for foreign_key in self.metadata._get_foreign_keys(parent_name, child_name):

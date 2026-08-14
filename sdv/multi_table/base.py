@@ -21,9 +21,15 @@ from sdv._utils import (
     check_sdv_versions_and_warn,
     check_synthesizer_version,
     generate_synthesizer_id,
+    is_spark_dataframe,
     warn_load_deprecated,
     warn_set_constraints_deprecated,
 )
+
+try:
+    from sdv.data_processing.spark_data_processor import SparkDataProcessor
+except ImportError:
+    SparkDataProcessor = None
 from sdv.cag._errors import ConstraintNotMetError
 from sdv.cag._utils import (
     _convert_to_snake_case,
@@ -167,6 +173,7 @@ class BaseMultiTableSynthesizer:
 
         self._initialize_models()
         self._fitted = False
+        self._spark_mode = False
         self._constraints_fitted = False
         self._creation_date = datetime.datetime.today().strftime('%Y-%m-%d')
         self._fitted_date = None
@@ -645,6 +652,9 @@ class BaseMultiTableSynthesizer:
             dict:
                 A dictionary with the preprocessed data.
         """
+        if any(is_spark_dataframe(table_data) for table_data in data.values()):
+            return self._preprocess_spark(data)
+
         list_of_changed_tables = self._store_and_convert_original_cols(data)
         self.validate(data)
         data = self._validate_transform_constraints(data)
@@ -697,6 +707,17 @@ class BaseMultiTableSynthesizer:
             processed_data (dict):
                 Dictionary mapping each table name to a preprocessed ``pandas.DataFrame``.
         """
+        if any(is_spark_dataframe(table_data) for table_data in processed_data.values()):
+            check_synthesizer_version(self, is_fit_method=True, compare_operator=operator.lt)
+            with disable_single_table_logger():
+                augmented_data = self._augment_tables(processed_data)
+                self._model_tables(augmented_data)
+            self._fitted = True
+            self._fitted_date = datetime.datetime.today().strftime('%Y-%m-%d')
+            self._fitted_sdv_version = getattr(version, 'community', None)
+            self._fitted_sdv_enterprise_version = getattr(version, 'enterprise', None)
+            return
+
         total_rows = 0
         total_columns = 0
         for table in processed_data.values():
@@ -731,6 +752,10 @@ class BaseMultiTableSynthesizer:
                 Dictionary mapping each table name to a ``pandas.DataFrame`` in the raw format
                 (before any transformations).
         """
+        if any(is_spark_dataframe(table_data) for table_data in data.values()):
+            self._spark_mode = True
+            return self._fit_spark(data)
+
         empty_tables = [table_name for table_name, table_data in data.items() if table_data.empty]
         if empty_tables:
             raise ValueError(
@@ -781,6 +806,9 @@ class BaseMultiTableSynthesizer:
                 If ``scale`` is lower than ``1.0`` create fewer rows by the factor of ``scale``
                 than the original tables. Defaults to ``1.0``.
         """
+        if getattr(self, '_spark_mode', False) is True:
+            return self._sample_spark(scale)
+
         if not self._fitted:
             raise SamplingError(
                 'This synthesizer has not been fitted. Please fit your synthesizer first before '
@@ -984,3 +1012,23 @@ class BaseMultiTableSynthesizer:
         })
 
         return synthesizer
+
+    def _fit_spark(self, data):
+        check_synthesizer_version(self, is_fit_method=True, compare_operator=operator.lt)
+        self._check_metadata_updated()
+        self._fitted = False
+        processed_data = self.preprocess(data)
+        self._print(text='\n', end='')
+        self.fit_processed_data(processed_data)
+
+    def _preprocess_spark(self, data):
+        self.auto_assign_transformers(data)
+        processed_data = {}
+        for table_name, table_data in data.items():
+            synthesizer = self._table_synthesizers[table_name]
+            processed_data[table_name] = synthesizer.preprocess(table_data)
+        return processed_data
+
+    def _sample_spark(self, scale):
+        raise NotImplementedError("Spark execution not yet implemented")
+

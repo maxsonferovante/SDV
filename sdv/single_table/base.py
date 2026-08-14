@@ -31,9 +31,28 @@ from sdv._utils import (
     check_sdv_versions_and_warn,
     check_synthesizer_version,
     generate_synthesizer_id,
+    is_spark_dataframe,
     warn_load_deprecated,
     warn_set_constraints_deprecated,
 )
+
+import random
+import time
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    from pyspark.sql import SparkSession
+except ImportError:
+    SparkSession = None
+
+try:
+    from sdv.data_processing.spark_data_processor import SparkDataProcessor
+except ImportError:
+    SparkDataProcessor = None
 from sdv.cag._errors import ConstraintNotMetError
 from sdv.cag._utils import (
     _convert_to_snake_case,
@@ -205,6 +224,7 @@ class BaseSynthesizer:
         self._validate_regex_format()
         self._original_columns = pd.Index([])
         self._fitted = False
+        self._spark_mode = False
         self._random_state_set = False
         self._update_default_transformers()
         self._creation_date = datetime.datetime.today().strftime('%Y-%m-%d')
@@ -387,6 +407,18 @@ class BaseSynthesizer:
             data (pandas.DataFrame):
                 The raw data (before any transformations) that will be used to fit the model.
         """
+        if is_spark_dataframe(data):
+            self._spark_mode = True
+            if not isinstance(self._data_processor, SparkDataProcessor):
+                self._data_processor = SparkDataProcessor(
+                    metadata=self.metadata._convert_to_single_table(),
+                    enforce_rounding=self.enforce_rounding,
+                    enforce_min_max_values=self.enforce_min_max_values,
+                    locales=self.locales,
+                )
+            self._data_processor.prepare_for_fitting(data)
+            return
+
         self.validate(data)
         data = self._validate_transform_constraints(data)
         self._data_processor.prepare_for_fitting(data)
@@ -704,6 +736,9 @@ class BaseSynthesizer:
             pandas.DataFrame:
                 The preprocessed data.
         """
+        if is_spark_dataframe(data):
+            return self._preprocess_spark(data)
+
         is_converted = self._store_and_convert_original_cols(data)
         data = self._preprocess_helper(data)
         preprocess_data = self._preprocess(data)
@@ -728,6 +763,15 @@ class BaseSynthesizer:
             processed_data (pandas.DataFrame):
                 The transformed data used to fit the model to.
         """
+        if is_spark_dataframe(processed_data):
+            check_synthesizer_version(self, is_fit_method=True, compare_operator=operator.lt)
+            self._fit(processed_data)
+            self._fitted = True
+            self._fitted_date = datetime.datetime.today().strftime('%Y-%m-%d')
+            self._fitted_sdv_version = getattr(version, 'community', None)
+            self._fitted_sdv_enterprise_version = getattr(version, 'enterprise', None)
+            return
+
         SYNTHESIZER_LOGGER.info({
             'EVENT': 'Fit processed data',
             'TIMESTAMP': datetime.datetime.now(),
@@ -754,6 +798,10 @@ class BaseSynthesizer:
             data (pandas.DataFrame):
                 The raw data (before any transformations) to fit the model to.
         """
+        if is_spark_dataframe(data):
+            self._spark_mode = True
+            return self._fit_spark(data)
+
         SYNTHESIZER_LOGGER.info({
             'EVENT': 'Fit',
             'TIMESTAMP': datetime.datetime.now(),
@@ -774,6 +822,83 @@ class BaseSynthesizer:
         self.fit_processed_data(processed_data)
         if is_converted:
             data.columns = self._original_columns
+
+    def _fit_spark(self, data):
+        check_synthesizer_version(self, is_fit_method=True, compare_operator=operator.lt)
+        self._check_input_metadata_updated()
+        self._fitted = False
+        processed_data = self.preprocess(data)
+        self.fit_processed_data(processed_data)
+
+    def _preprocess_spark(self, data):
+        if not isinstance(self._data_processor, SparkDataProcessor):
+            self._data_processor = SparkDataProcessor(
+                metadata=self.metadata._convert_to_single_table(),
+                enforce_rounding=self.enforce_rounding,
+                enforce_min_max_values=self.enforce_min_max_values,
+                locales=self.locales,
+            )
+        if not self._data_processor.fitted:
+            self._data_processor.fit(data)
+
+        return self._data_processor.transform(data)
+
+    def _sample_spark(self, num_rows, max_tries_per_batch=100, batch_size=None, output_file_path=None, keep_extra_columns=False):
+        spark = SparkSession.builder.getOrCreate()
+        sc = spark.sparkContext
+
+        # Determine partition sizes (target 100,000 rows per partition)
+        num_partitions = max(2, num_rows // 100000)
+        skeleton_df = spark.range(0, num_rows, numPartitions=num_partitions)
+
+        # 1. Perform dry run on driver to get schema
+        dummy_pdf = self._model.sample(1)
+        dummy_reversed = self._data_processor._data_processor.reverse_transform(dummy_pdf)
+        if keep_extra_columns:
+            input_columns = self._data_processor._data_processor._hyper_transformer._input_columns
+            missing_cols = list(
+                set(dummy_pdf.columns) - set(input_columns) - set(dummy_reversed.columns)
+            )
+            dummy_reversed = pd.concat([dummy_reversed, dummy_pdf.loc[dummy_reversed.index, missing_cols]], axis=1)
+        schema = self._data_processor._pandas_to_spark_schema(dummy_reversed)
+
+        # 2. Broadcast model and preprocessing parameters
+        model_broadcast = sc.broadcast(self._model)
+        dp_broadcast = sc.broadcast(self._data_processor._data_processor)
+
+        # 3. Define parallel generation mapper
+        def sample_partition(iterator):
+            local_model = model_broadcast.value
+            local_dp = dp_broadcast.value
+
+            # Count rows allocated to this partition
+            count = sum(1 for _ in iterator)
+            if count == 0:
+                return
+
+            # ponytail: Random seeds inside parallel workers are derived from local system entropy to ensure unique synthetic rows per partition.
+            import numpy as np
+            import torch
+            import random
+            import time
+            seed = int(time.time() * 1000) % 2**32
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            random.seed(seed)
+
+            # Generate synthetic numeric rows
+            pdf = local_model.sample(count)
+            # Reverse transform to original domain
+            reversed_pdf = local_dp.reverse_transform(pdf)
+            if keep_extra_columns:
+                input_columns = local_dp._hyper_transformer._input_columns
+                missing_cols = list(
+                    set(pdf.columns) - set(input_columns) - set(reversed_pdf.columns)
+                )
+                reversed_pdf = pd.concat([reversed_pdf, pdf.loc[reversed_pdf.index, missing_cols]], axis=1)
+            yield reversed_pdf
+
+        return skeleton_df.mapInPandas(sample_partition, schema)
 
     def _validate_fit_before_save(self):
         """Validate that the synthesizer has been fitted before saving."""
@@ -1278,6 +1403,9 @@ class BaseSingleTableSynthesizer(BaseSynthesizer):
             pandas.DataFrame:
                 Sampled data.
         """
+        if getattr(self, '_spark_mode', False) is True:
+            return self._sample_spark(num_rows, max_tries_per_batch, batch_size, output_file_path)
+
         self._validate_fit_before_sample()
         self._check_input_metadata_updated()
         sample_timestamp = datetime.datetime.now()
@@ -1615,3 +1743,4 @@ class BaseSingleTableSynthesizer(BaseSynthesizer):
         })
 
         return sampled
+

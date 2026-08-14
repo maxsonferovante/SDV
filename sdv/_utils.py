@@ -562,3 +562,11 @@ def _get_unreferenced_keys(parent_columns, child_columns):
 def _validate_boolean_parameter(parameter, parameter_name):
     if not isinstance(parameter, bool):
         raise ValueError(f"'{parameter_name}' must be a boolean value.")
+
+
+def is_spark_dataframe(data):
+    """Check if the data is a PySpark DataFrame without importing pyspark."""
+    cls_name = type(data).__name__
+    module_name = type(data).__module__
+    return cls_name == 'DataFrame' and module_name.startswith('pyspark.sql')
+
