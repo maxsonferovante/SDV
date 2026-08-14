@@ -135,10 +135,19 @@ class GaussianCopulaSynthesizer(BaseSingleTableSynthesizer):
                 Data to be learned.
         """
         warn_missing_numerical_distributions(self.numerical_distributions, processed_data.columns)
-        self._num_rows = self._learn_num_rows(processed_data)
-        numerical_distributions = self._get_numerical_distributions(processed_data)
-        self._model = self._initialize_model(numerical_distributions)
-        self._fit_model(processed_data)
+        from sdv._utils import is_spark_dataframe
+        if is_spark_dataframe(processed_data):
+            self._num_rows = processed_data.count()
+            numerical_distributions = self._get_numerical_distributions(processed_data)
+            self._model = self._initialize_model(numerical_distributions)
+            # Collect to pandas for local fitting of GaussianMultivariate
+            pdf = processed_data.toPandas()
+            self._fit_model(pdf)
+        else:
+            self._num_rows = self._learn_num_rows(processed_data)
+            numerical_distributions = self._get_numerical_distributions(processed_data)
+            self._model = self._initialize_model(numerical_distributions)
+            self._fit_model(processed_data)
 
     def _learn_num_rows(self, processed_data):
         return len(processed_data)

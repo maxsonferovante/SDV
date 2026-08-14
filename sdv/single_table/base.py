@@ -46,8 +46,10 @@ except ImportError:
 
 try:
     from pyspark.sql import SparkSession
+    from pyspark.sql import functions as F
 except ImportError:
     SparkSession = None
+    F = None
 
 try:
     from sdv.data_processing.spark_data_processor import SparkDataProcessor
@@ -851,7 +853,17 @@ class BaseSynthesizer:
         num_partitions = max(2, num_rows // 100000)
         skeleton_df = spark.range(0, num_rows, numPartitions=num_partitions)
 
-        # 1. Perform dry run on driver to get schema
+        # Detect id-typed primary key: AnonymizedFaker(cardinality_rule='unique') uses a fixed
+        # pool per-worker that causes row loss when multiple partitions draw from the same pool.
+        # We strip the PK from worker output and re-add it after via monotonically_increasing_id().
+        pk_col = None
+        table_meta = self.metadata.tables.get(self._table_name)
+        if table_meta is not None:
+            pk = getattr(table_meta, 'primary_key', None)
+            if pk and table_meta.columns.get(pk, {}).get('sdtype', '') == 'id':
+                pk_col = pk
+
+        # 1. Perform dry run on driver to get schema (excluding pk_col to avoid cardinality clash)
         dummy_pdf = self._model.sample(1)
         dummy_reversed = self._data_processor._data_processor.reverse_transform(dummy_pdf)
         if keep_extra_columns:
@@ -860,19 +872,23 @@ class BaseSynthesizer:
                 set(dummy_pdf.columns) - set(input_columns) - set(dummy_reversed.columns)
             )
             dummy_reversed = pd.concat([dummy_reversed, dummy_pdf.loc[dummy_reversed.index, missing_cols]], axis=1)
+        if pk_col and pk_col in dummy_reversed.columns:
+            dummy_reversed = dummy_reversed.drop(columns=[pk_col])
         schema = self._data_processor._pandas_to_spark_schema(dummy_reversed)
 
         # 2. Broadcast model and preprocessing parameters
         model_broadcast = sc.broadcast(self._model)
         dp_broadcast = sc.broadcast(self._data_processor._data_processor)
+        pk_col_broadcast = sc.broadcast(pk_col)
 
         # 3. Define parallel generation mapper
         def sample_partition(iterator):
             local_model = model_broadcast.value
             local_dp = dp_broadcast.value
+            local_pk = pk_col_broadcast.value
 
-            # Count rows allocated to this partition
-            count = sum(1 for _ in iterator)
+            # Count total rows allocated to this partition (iterator yields pandas batches)
+            count = sum(len(b) for b in iterator)
             if count == 0:
                 return
 
@@ -896,9 +912,20 @@ class BaseSynthesizer:
                     set(pdf.columns) - set(input_columns) - set(reversed_pdf.columns)
                 )
                 reversed_pdf = pd.concat([reversed_pdf, pdf.loc[reversed_pdf.index, missing_cols]], axis=1)
+            # Drop PK: it will be re-added after mapInPandas using monotonically_increasing_id()
+            if local_pk and local_pk in reversed_pdf.columns:
+                reversed_pdf = reversed_pdf.drop(columns=[local_pk])
             yield reversed_pdf
 
-        return skeleton_df.mapInPandas(sample_partition, schema)
+        sampled_df = skeleton_df.mapInPandas(sample_partition, schema)
+
+        # Re-add id-typed PK with globally unique IDs (no worker coordination needed).
+        # ponytail: monotonically_increasing_id() is not sequential but is unique; upgrade path
+        # is a windowed row_number() over a partition column if strictly sequential IDs are needed.
+        if pk_col:
+            sampled_df = sampled_df.withColumn(pk_col, F.monotonically_increasing_id())
+
+        return sampled_df
 
     def _validate_fit_before_save(self):
         """Validate that the synthesizer has been fitted before saving."""
