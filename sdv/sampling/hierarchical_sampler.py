@@ -455,7 +455,7 @@ class BaseHierarchicalSampler:
                         if pdf[num_rows_key].sum() == total_parent_rows:
                             break
             
-            spark = sampled_data[table_name].sql_ctx.sparkSession
+            spark = sampled_data[table_name].sparkSession
             parent_df = sampled_data[table_name].drop(num_rows_key)
             # Derive schema from parent DF to avoid type mismatch in join
             parent_key_type = dict(parent_df.dtypes)[parent_key]

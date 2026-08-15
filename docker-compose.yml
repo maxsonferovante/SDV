@@ -27,7 +27,10 @@ services:
       - .:/app
       - /app/.venv  # Mask host virtualenv to prevent binary conflicts
     working_dir: /app
-    entrypoint: python3 test_single_table_copulagan_spark.py
+    entrypoint: >
+      sh -c "python3 test_single_table_copula_spark.py &&
+             python3 test_single_table_copulagan_spark.py &&
+             python3 test_czech_financial_spark.py"
     depends_on:
       - spark-master
       - spark-worker

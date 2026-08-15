@@ -66,7 +66,7 @@ class SparkDataProcessor:
         schema = self._pandas_to_spark_schema(dummy_transformed)
 
         # 2. Broadcast the driver-fitted preprocessor to all executors
-        sc = data.sql_ctx.sparkSession.sparkContext
+        sc = data.sparkSession.sparkContext
         dp_broadcast = sc.broadcast(self._data_processor)
 
         # 3. Apply transformation in parallel
