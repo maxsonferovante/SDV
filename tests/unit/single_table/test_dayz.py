@@ -647,3 +647,25 @@ class TestDayZSynthesizer:
             },
             'DAYZ_SPEC_VERSION': 'V1',
         }
+
+    def test_create_parameters_spark_dataframe(self):
+        """Test that create_parameters collects Spark DataFrame to pandas."""
+        class MockSparkDataFrame:
+            def __init__(self, df):
+                self.df = df
+            def toPandas(self):
+                return self.df
+
+        MockSparkDataFrame.__name__ = 'DataFrame'
+        MockSparkDataFrame.__module__ = 'pyspark.sql.dataframe'
+
+        # Setup
+        real_pdf = pd.DataFrame({'col': [1, 2, 3]})
+        spark_df = MockSparkDataFrame(real_pdf)
+        metadata = Metadata.detect_from_dataframe(real_pdf)
+
+        # Run
+        params = DayZSynthesizer.create_parameters(spark_df, metadata)
+
+        # Assert
+        assert params['tables']['table']['num_rows'] == 3

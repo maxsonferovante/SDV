@@ -55,7 +55,7 @@ class TestSparkCopulaGAN:
             # GaussianNormalizer config must receive the collected pandas DF
             mock_cfg.assert_called_once_with(pdf)
 
-    @patch('sdv.single_table.copulagan.SparkSession')
+    @patch('sdv.single_table.ctgan.SparkSession')
     def test_sample_spark_generates_on_driver(self, mock_spark_cls):
         """_sample_spark generates on driver (PyTorch cannot run in Spark workers) and wraps as Spark DF."""
         synthesizer = MagicMock()

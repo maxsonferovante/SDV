@@ -62,6 +62,37 @@ def evaluate_quality(real_data, synthetic_data, metadata, verbose=True):
         QualityReport:
             Single table quality report object.
     """
+    from sdv._utils import is_spark_dataframe
+
+    is_real_spark = is_spark_dataframe(real_data) or (
+        isinstance(real_data, dict) and any(is_spark_dataframe(df) for df in real_data.values())
+    )
+    is_synth_spark = is_spark_dataframe(synthetic_data) or (
+        isinstance(synthetic_data, dict) and any(is_spark_dataframe(df) for df in synthetic_data.values())
+    )
+
+    if is_real_spark or is_synth_spark:
+        if type(real_data) is not type(synthetic_data):
+            raise TypeError(
+                'real_data and synthetic_data must have the same type. '
+                f'Got {type(real_data).__name__} and '
+                f'{type(synthetic_data).__name__}.'
+            )
+
+        if is_spark_dataframe(real_data):
+            table_name = DEFAULT_SINGLE_TABLE_NAME
+            if isinstance(metadata, Metadata):
+                table_name = metadata._get_single_table_name() or table_name
+            else:
+                metadata = Metadata.load_from_dict(
+                    metadata.to_dict(), single_table_name=DEFAULT_SINGLE_TABLE_NAME
+                )
+            real_data = {table_name: real_data}
+            synthetic_data = {table_name: synthetic_data}
+
+        from sdv.evaluation.spark_quality import evaluate_quality_spark
+        return evaluate_quality_spark(real_data, synthetic_data, metadata, verbose)
+
     _validate_data(real_data, synthetic_data)
     real_data, synthetic_data, metadata = _handle_single_table(
         real_data=real_data,
@@ -91,6 +122,18 @@ def run_diagnostic(real_data, synthetic_data, metadata, verbose=True):
         DiagnosticReport:
             Single table diagnostic report object.
     """
+    from sdv._utils import is_spark_dataframe
+
+    is_real_spark = is_spark_dataframe(real_data) or (
+        isinstance(real_data, dict) and any(is_spark_dataframe(df) for df in real_data.values())
+    )
+    is_synth_spark = is_spark_dataframe(synthetic_data) or (
+        isinstance(synthetic_data, dict) and any(is_spark_dataframe(df) for df in synthetic_data.values())
+    )
+
+    if is_real_spark or is_synth_spark:
+        raise NotImplementedError('Diagnostic evaluation is not supported for PySpark DataFrames.')
+
     _validate_data(real_data, synthetic_data)
     real_data, synthetic_data, metadata = _handle_single_table(
         real_data=real_data,

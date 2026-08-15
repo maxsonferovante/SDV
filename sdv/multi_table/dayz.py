@@ -64,6 +64,9 @@ def _detect_relationship_parameters(data, metadata):
 
 def create_parameters_multi_table(data, metadata, output_filename):
     """Create parameters for the DayZSynthesizer."""
+    from sdv._utils import is_spark_dataframe
+    if isinstance(data, dict):
+        data = {name: df.toPandas() if is_spark_dataframe(df) else df for name, df in data.items()}
     parameters = create_parameters(data, metadata, None)
     parameters['relationships'] = _detect_relationship_parameters(data, metadata)
     if output_filename:
