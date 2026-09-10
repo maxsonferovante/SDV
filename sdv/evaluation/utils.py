@@ -6,7 +6,7 @@ import warnings
 import pandas as pd
 from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
 
-from sdv._utils import _cast_to_iterable, _check_is_dict_of_dataframes
+from sdv._utils import _cast_to_iterable, _check_is_dict_of_dataframes, is_spark_dataframe
 from sdv.metadata import Metadata
 
 MISSING_VALUE_PLACEHOLDER = '__sdv_missing_value__'
@@ -19,7 +19,16 @@ def _validate_referential_integrity_inputs(
     if not isinstance(metadata, Metadata):
         raise TypeError('metadata must be of Metadata type.')
 
-    _check_is_dict_of_dataframes(synthetic_data, 'synthetic_data')
+    if not isinstance(synthetic_data, dict):
+        raise ValueError(
+            "'synthetic_data' must be a dictionary that maps table names to DataFrames."
+        )
+
+    for tname, table in synthetic_data.items():
+        if not isinstance(table, pd.DataFrame) and not is_spark_dataframe(table):
+            raise ValueError(
+                "'synthetic_data' must be a dictionary that maps table names to DataFrames."
+            )
 
     if not isinstance(table_name, str):
         raise TypeError('table_name must be a string.')
@@ -91,6 +100,75 @@ def _format_key(key_names, key_values):
     return ', '.join(f'{name}: {value}' for name, value in zip(key_names, key_values))
 
 
+def _print_referential_integrity_pandas(
+    child_data, parent_keys, parent_table_name, parent_primary_keys,
+    foreign_key_names, child_primary_keys, table_name, num_rows
+):
+    """Run referential integrity check using pandas DataFrames."""
+    if len(child_data) < num_rows:
+        warnings.warn(
+            f"The synthetic data contains '{len(child_data)}' rows which is less than "
+            f"num_rows: '{num_rows}'. Changing num_rows to '{len(child_data)}'."
+        )
+        num_rows = len(child_data)
+
+    parent_key_set = set(parent_keys)
+
+    for _, child_row in child_data.sample(n=num_rows, replace=False).iterrows():
+        heading = f'Picking random {table_name} row'
+        if child_primary_keys:
+            key_values = ', '.join(str(child_row[name]) for name in child_primary_keys)
+            heading += f': {key_values}'
+
+        foreign_key_values = tuple(child_row[name] for name in foreign_key_names)
+        if any(pd.isna(value) for value in foreign_key_values):
+            result = '✅ Foreign key is null; no linked parent row expected'
+        elif foreign_key_values in parent_key_set:
+            found = _format_key(parent_primary_keys, foreign_key_values)
+            result = f'✅ Found {parent_table_name} row! {found}'
+        else:
+            result = f'❌ Unable to find the linked {parent_table_name} row'
+
+        sys.stdout.write(f'{heading}\n{result}\n\n')
+
+
+def _print_referential_integrity_spark(
+    child_data, parent_keys, parent_table_name, parent_primary_keys,
+    foreign_key_names, child_primary_keys, table_name, num_rows
+):
+    """Run referential integrity check using PySpark DataFrames."""
+    from pyspark.sql import functions as F
+
+    child_count = child_data.count()
+    if child_count < num_rows:
+        warnings.warn(
+            f"The synthetic data contains '{child_count}' rows which is less than "
+            f"num_rows: '{num_rows}'. Changing num_rows to '{child_count}'."
+        )
+        num_rows = child_count
+
+    parent_key_set = set(parent_keys)
+
+    sampled = child_data.orderBy(F.rand()).limit(num_rows).collect()
+
+    for child_row in sampled:
+        heading = f'Picking random {table_name} row'
+        if child_primary_keys:
+            key_values = ', '.join(str(child_row[name]) for name in child_primary_keys)
+            heading += f': {key_values}'
+
+        foreign_key_values = tuple(child_row[name] for name in foreign_key_names)
+        if any(v is None for v in foreign_key_values):
+            result = '✅ Foreign key is null; no linked parent row expected'
+        elif foreign_key_values in parent_key_set:
+            found = _format_key(parent_primary_keys, foreign_key_values)
+            result = f'✅ Found {parent_table_name} row! {found}'
+        else:
+            result = f'❌ Unable to find the linked {parent_table_name} row'
+
+        sys.stdout.write(f'{heading}\n{result}\n\n')
+
+
 def print_referential_integrity(
     metadata, synthetic_data, table_name, foreign_key_name, num_rows=10
 ):
@@ -103,8 +181,8 @@ def print_referential_integrity(
         metadata (Metadata):
             The metadata object describing the synthetic data.
         synthetic_data (dict):
-            A dictionary mapping each table name to a pandas DataFrame containing the
-            synthetic data for it.
+            A dictionary mapping each table name to a pandas or Spark DataFrame containing
+            the synthetic data for it.
         table_name (str):
             The name of the table that contains the foreign key to check.
         foreign_key_name (str or tuple[str]):
@@ -128,33 +206,29 @@ def print_referential_integrity(
     )
 
     child_data = synthetic_data[table_name]
-    if len(child_data) < num_rows:
-        warnings.warn(
-            f"The synthetic data contains '{len(child_data)}' rows which is less than "
-            f"num_rows: '{num_rows}'. Changing num_rows to '{len(child_data)}'."
-        )
-        num_rows = len(child_data)
-
     parent_data = synthetic_data[parent_table_name]
-    parent_keys = set(parent_data[parent_primary_keys].itertuples(index=False, name=None))
     child_primary_keys = _cast_to_iterable(metadata.tables[table_name].primary_key or [])
 
-    for _, child_row in child_data.sample(n=num_rows, replace=False).iterrows():
-        heading = f'Picking random {table_name} row'
-        if child_primary_keys:
-            key_values = ', '.join(str(child_row[name]) for name in child_primary_keys)
-            heading += f': {key_values}'
+    if is_spark_dataframe(parent_data):
+        parent_keys = [
+            tuple(row[name] for name in parent_primary_keys)
+            for row in parent_data.select(parent_primary_keys).collect()
+        ]
+    else:
+        parent_keys = list(
+            parent_data[parent_primary_keys].itertuples(index=False, name=None)
+        )
 
-        foreign_key_values = tuple(child_row[name] for name in foreign_key_names)
-        if any(pd.isna(value) for value in foreign_key_values):
-            result = '✅ Foreign key is null; no linked parent row expected'
-        elif foreign_key_values in parent_keys:
-            found = _format_key(parent_primary_keys, foreign_key_values)
-            result = f'✅ Found {parent_table_name} row! {found}'
-        else:
-            result = f'❌ Unable to find the linked {parent_table_name} row'
-
-        sys.stdout.write(f'{heading}\n{result}\n\n')
+    if is_spark_dataframe(child_data):
+        _print_referential_integrity_spark(
+            child_data, parent_keys, parent_table_name, parent_primary_keys,
+            foreign_key_names, child_primary_keys, table_name, num_rows,
+        )
+    else:
+        _print_referential_integrity_pandas(
+            child_data, parent_keys, parent_table_name, parent_primary_keys,
+            foreign_key_names, child_primary_keys, table_name, num_rows,
+        )
 
 
 def _validate_data(real_data, synthetic_data, table_name, column_names):
@@ -219,23 +293,8 @@ def _get_combinations(data):
     return set(combinations.itertuples(index=False, name=None))
 
 
-def _compute_overlap(real_data, synthetic_data, table_name, column_names):
-    """Get the number of combinations shared by both datasets and the percentage they represent.
-
-    Args:
-        real_data (dict):
-            A dictionary mapping a table name to a pandas DataFrame containing real data.
-        synthetic_data (dict):
-            A dictionary mapping a table name to a pandas DataFrame containing synthetic data.
-        table_name (str):
-            The name of the table that contains the columns to check.
-        column_names (list[str]):
-            The column names to combine.
-
-    Returns:
-        tuple[int, float]:
-            The number of shared combinations and their percentage of all combinations.
-    """
+def _compute_overlap_pandas(real_data, synthetic_data, table_name, column_names):
+    """Compute overlap using pandas DataFrames."""
     real_values = real_data[table_name][column_names].copy()
     synthetic_values = synthetic_data[table_name][column_names].copy()
     for column_name in column_names:
@@ -253,14 +312,63 @@ def _compute_overlap(real_data, synthetic_data, table_name, column_names):
     return num_common, percent
 
 
+def _compute_overlap_spark(real_data, synthetic_data, table_name, column_names):
+    """Compute overlap using PySpark DataFrames."""
+    from pyspark.sql import functions as F
+
+    real_df = real_data[table_name]
+    synth_df = synthetic_data[table_name]
+
+    real_select = real_df.select([F.col(c).cast('string').alias(c) for c in column_names])
+    synth_select = synth_df.select([F.col(c).cast('string').alias(c) for c in column_names])
+
+    real_distinct = real_select.distinct()
+    synth_distinct = synth_select.distinct()
+
+    num_common = real_distinct.intersect(synth_distinct).count()
+    num_total = real_distinct.union(synth_distinct).distinct().count()
+    percent = round(num_common / num_total * 100, 2) if num_total else 0.0
+
+    return num_common, percent
+
+
+def _compute_overlap(real_data, synthetic_data, table_name, column_names):
+    """Get the number of combinations shared by both datasets and the percentage they represent.
+
+    Args:
+        real_data (dict):
+            A dictionary mapping a table name to a pandas or Spark DataFrame containing real data.
+        synthetic_data (dict):
+            A dictionary mapping a table name to a pandas or Spark DataFrame containing
+            synthetic data.
+        table_name (str):
+            The name of the table that contains the columns to check.
+        column_names (list[str]):
+            The column names to combine.
+
+    Returns:
+        tuple[int, float]:
+            The number of shared combinations and their percentage of all combinations.
+    """
+    real_df = real_data[table_name]
+    synth_df = synthetic_data[table_name]
+
+    if is_spark_dataframe(real_df) or is_spark_dataframe(synth_df):
+        return _compute_overlap_spark(real_data, synthetic_data, table_name, column_names)
+
+    return _compute_overlap_pandas(real_data, synthetic_data, table_name, column_names)
+
+
 def get_combination_overlap(real_data, synthetic_data, table_name, column_names, verbose=True):
     """Calculate the overlap of combinations of column values between real and synthetic data.
 
     Args:
         real_data (dict):
-            A dictionary mapping a table name to a pandas DataFrame containing real data.
+            A dictionary mapping a table name to a pandas or Spark DataFrame containing
+            real data.
         synthetic_data (dict):
-            A dictionary mapping a table name to a pandas DataFrame containing synthetic data.
+            A dictionary mapping a table name to a pandas or Spark DataFrame containing
+            synthetic data.
         table_name (str):
             The name of the table that contains the columns to check.
         column_names (list[str]):
@@ -310,9 +418,11 @@ def get_pii_overlap(real_data, synthetic_data, table_name, pii_column_name, verb
 
     Args:
         real_data (dict):
-            A dictionary mapping a table name to a pandas DataFrame containing real data.
+            A dictionary mapping a table name to a pandas or Spark DataFrame containing
+            real data.
         synthetic_data (dict):
-            A dictionary mapping a table name to a pandas DataFrame containing synthetic data.
+            A dictionary mapping a table name to a pandas or Spark DataFrame containing
+            synthetic data.
         table_name (str):
             The name of the table that contains the PII column to check.
         pii_column_name (str):
