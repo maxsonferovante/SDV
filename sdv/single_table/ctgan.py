@@ -11,6 +11,23 @@ from sdv.errors import InvalidDataTypeError, NotFittedError
 from sdv.single_table.base import BaseSingleTableSynthesizer
 from sdv.single_table.utils import detect_discrete_columns
 from sdv.utils.mixins import MissingModuleMixin
+from sdv._utils import is_spark_dataframe
+import os
+import tempfile
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    from pyspark.ml.torch.distributor import TorchDistributor
+    from pyspark.sql import SparkSession
+    from pyspark.sql import functions as F
+except ImportError:
+    TorchDistributor = None
+    SparkSession = None
+    F = None
 
 try:
     from ctgan import CTGAN, TVAE
@@ -21,6 +38,84 @@ except ModuleNotFoundError as e:
     CTGAN = None
     TVAE = None
     import_error = e
+
+
+def _fit_spark_pytorch(synthesizer, processed_data, model_class):
+    
+    temp_dir = tempfile.mkdtemp()
+    data_path = os.path.join(temp_dir, "processed_data.parquet")
+    model_path = os.path.join(temp_dir, "model.pt")
+    
+    processed_data.write.parquet(data_path)
+    
+    model_kwargs = synthesizer._model_kwargs
+    transformers = synthesizer._data_processor._hyper_transformer.field_transformers
+    
+    sample_pdf = processed_data.limit(100).toPandas()
+    discrete_columns = detect_discrete_columns(synthesizer.metadata, sample_pdf, transformers)
+    
+    def train_fn():
+        # ponytail: For this prototype, we train standard PyTorch model under TorchDistributor. In a full production upgrade path, we wrap CTGAN/TVAE models in DistributedDataParallel (DDP).
+        pass
+        
+        spark = SparkSession.builder.getOrCreate()
+        local_df = spark.read.parquet(data_path).toPandas()
+        
+        model = model_class(**model_kwargs)
+        model.fit(local_df, discrete_columns=discrete_columns)
+        
+        rank = int(os.environ.get("RANK", "0"))
+        if rank == 0:
+            torch.save(model, model_path)
+            
+    use_gpu = model_kwargs.get("enable_gpu", False)
+    distributor = TorchDistributor(num_processes=2, use_gpu=use_gpu)
+    distributor.run(train_fn)
+    
+    synthesizer._model = torch.load(model_path)
+
+
+def _sample_spark_pytorch(synthesizer, num_rows, max_tries_per_batch=100, batch_size=None, output_file_path=None, keep_extra_columns=False):
+    """Driver-side sampling in micro-batches to avoid memory peaks for PyTorch models."""
+    chunk_size = batch_size or 50000
+    
+    # ponytail: Safeguard: Limit the number of chunks to 200 to prevent PySpark planning JVM StackOverflowError.
+    if num_rows / chunk_size > 200:
+        chunk_size = max(chunk_size, num_rows // 200)
+
+    spark = SparkSession.builder.getOrCreate()
+    
+    pk_col = None
+    table_meta = synthesizer.metadata.tables.get(synthesizer._table_name)
+    if table_meta is not None:
+        pk = getattr(table_meta, 'primary_key', None)
+        if pk and table_meta.columns.get(pk, {}).get('sdtype', '') == 'id':
+            pk_col = pk
+
+    chunks = []
+    remaining = num_rows
+    while remaining > 0:
+        current_chunk = min(remaining, chunk_size)
+        pdf = synthesizer._model.sample(current_chunk)
+        if hasattr(synthesizer, '_gaussian_normalizer_hyper_transformer'):
+            pdf = synthesizer._gaussian_normalizer_hyper_transformer.reverse_transform(pdf)
+        pdf = synthesizer._data_processor._data_processor.reverse_transform(pdf)
+        
+        spark_df_chunk = spark.createDataFrame(pdf)
+        chunks.append(spark_df_chunk)
+        remaining -= current_chunk
+
+    if len(chunks) == 1:
+        spark_df = chunks[0]
+    else:
+        spark_df = chunks[0]
+        for next_chunk in chunks[1:]:
+            spark_df = spark_df.union(next_chunk)
+
+    if pk_col and pk_col in spark_df.columns:
+        spark_df = spark_df.withColumn(pk_col, F.monotonically_increasing_id())
+        
+    return spark_df
 
 
 def _validate_no_category_dtype(data):
@@ -298,6 +393,10 @@ class CTGANSynthesizer(LossValuesMixin, MissingModuleMixin, BaseSingleTableSynth
             processed_data (pandas.DataFrame):
                 Data to be learned.
         """
+        if is_spark_dataframe(processed_data):
+            _fit_spark_pytorch(self, processed_data, CTGAN)
+            return
+
         _validate_no_category_dtype(processed_data)
 
         transformers = self._data_processor._hyper_transformer.field_transformers
@@ -326,6 +425,16 @@ class CTGANSynthesizer(LossValuesMixin, MissingModuleMixin, BaseSingleTableSynth
             return self._model.sample(num_rows)
 
         raise NotImplementedError("CTGANSynthesizer doesn't support conditional sampling.")
+
+    def _sample_spark(self, num_rows, max_tries_per_batch=100, batch_size=None, output_file_path=None, keep_extra_columns=False):
+        return _sample_spark_pytorch(
+            self,
+            num_rows=num_rows,
+            max_tries_per_batch=max_tries_per_batch,
+            batch_size=batch_size,
+            output_file_path=output_file_path,
+            keep_extra_columns=keep_extra_columns
+        )
 
 
 class TVAESynthesizer(LossValuesMixin, MissingModuleMixin, BaseSingleTableSynthesizer):
@@ -420,6 +529,10 @@ class TVAESynthesizer(LossValuesMixin, MissingModuleMixin, BaseSingleTableSynthe
             processed_data (pandas.DataFrame):
                 Data to be learned.
         """
+        if is_spark_dataframe(processed_data):
+            _fit_spark_pytorch(self, processed_data, TVAE)
+            return
+
         _validate_no_category_dtype(processed_data)
 
         transformers = self._data_processor._hyper_transformer.field_transformers
@@ -429,6 +542,7 @@ class TVAESynthesizer(LossValuesMixin, MissingModuleMixin, BaseSingleTableSynthe
 
     def _sample(self, num_rows, conditions=None):
         """Sample the indicated number of rows from the model.
+        
 
         Args:
             num_rows (int):
@@ -446,3 +560,13 @@ class TVAESynthesizer(LossValuesMixin, MissingModuleMixin, BaseSingleTableSynthe
             return self._model.sample(num_rows)
 
         raise NotImplementedError("TVAESynthesizer doesn't support conditional sampling.")
+
+    def _sample_spark(self, num_rows, max_tries_per_batch=100, batch_size=None, output_file_path=None, keep_extra_columns=False):
+        return _sample_spark_pytorch(
+            self,
+            num_rows=num_rows,
+            max_tries_per_batch=max_tries_per_batch,
+            batch_size=batch_size,
+            output_file_path=output_file_path,
+            keep_extra_columns=keep_extra_columns
+        )

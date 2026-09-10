@@ -1,6 +1,6 @@
 import json
 import re
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 import pandas as pd
 import pytest
@@ -438,3 +438,44 @@ class TestDayZSynthesizer:
 
         with pytest.raises(SynthesizerProcessingError, match=expected_msg):
             DayZSynthesizer.validate_parameters(metadata, {'relationships': ['a', 'b', 'c']})
+
+    def test_create_parameters_spark_dataframe(self):
+        """Test that create_parameters converts dictionary of Spark DataFrames to pandas."""
+        class MockSparkDataFrame:
+            def __init__(self, df):
+                self.df = df
+            def toPandas(self):
+                return self.df
+
+        MockSparkDataFrame.__name__ = 'DataFrame'
+        MockSparkDataFrame.__module__ = 'pyspark.sql.dataframe'
+
+        # Setup
+        real_parent = pd.DataFrame({'id': [1, 2, 3]})
+        real_child = pd.DataFrame({'id': [10, 11], 'child_fk': [1, 2]})
+
+        spark_parent = MockSparkDataFrame(real_parent)
+        spark_child = MockSparkDataFrame(real_child)
+
+        data = {
+            'parent': spark_parent,
+            'child': spark_child,
+        }
+
+        metadata = Metadata()
+        metadata.add_table('parent')
+        metadata.add_column('id', 'parent', sdtype='id')
+        metadata.set_primary_key('id', 'parent')
+
+        metadata.add_table('child')
+        metadata.add_column('id', 'child', sdtype='id')
+        metadata.add_column('child_fk', 'child', sdtype='id')
+
+        metadata.add_relationship('parent', 'child', 'id', 'child_fk')
+
+        # Run
+        params = DayZSynthesizer.create_parameters(data, metadata)
+
+        # Assert
+        assert params['tables']['parent']['num_rows'] == 3
+        assert params['tables']['child']['num_rows'] == 2

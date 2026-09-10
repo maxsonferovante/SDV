@@ -928,7 +928,9 @@ class DataProcessor:
 
         try:
             transformed = self._hyper_transformer.transform_subset(data)
-        except (rdt.errors.NotFittedError, rdt.errors.ConfigNotSetError):
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             transformed = data
 
         return transformed

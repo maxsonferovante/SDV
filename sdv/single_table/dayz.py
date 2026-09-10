@@ -145,6 +145,12 @@ def _detect_column_parameters(data, metadata, table_name):
 
 def create_parameters(data, metadata, output_filename):
     """Detect and create a parameter dict for the DayZ model."""
+    from sdv._utils import is_spark_dataframe
+    if is_spark_dataframe(data):
+        data = data.toPandas()
+    elif isinstance(data, dict):
+        data = {name: df.toPandas() if is_spark_dataframe(df) else df for name, df in data.items()}
+
     if len(data) == 0:
         raise ValueError('Data is empty')
     if len(metadata.tables) == 0:

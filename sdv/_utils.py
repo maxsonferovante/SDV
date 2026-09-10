@@ -574,3 +574,10 @@ def _check_is_dict_of_dataframes(data, arg_name='data'):
     for table_name, table in data.items():
         if not isinstance(table, pd.DataFrame):
             raise ValueError(error_message_data)
+
+
+def is_spark_dataframe(data):
+    """Check if the data is a PySpark DataFrame without importing pyspark."""
+    cls_name = type(data).__name__
+    module_name = type(data).__module__
+    return cls_name == 'DataFrame' and module_name.startswith('pyspark.sql')

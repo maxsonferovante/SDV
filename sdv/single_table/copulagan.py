@@ -5,12 +5,20 @@ from copy import deepcopy
 
 import rdt
 
+from sdv._utils import is_spark_dataframe
 from sdv.single_table.copulas import GaussianCopulaSynthesizer
 from sdv.single_table.ctgan import CTGANSynthesizer
 from sdv.single_table.utils import (
     validate_numerical_distributions,
     warn_missing_numerical_distributions,
 )
+
+try:
+    from pyspark.sql import SparkSession
+    from pyspark.sql import functions as F
+except ImportError:
+    SparkSession = None
+    F = None
 
 LOGGER = logging.getLogger(__name__)
 
@@ -210,9 +218,15 @@ class CopulaGANSynthesizer(CTGANSynthesizer):
         """Fit the model to the table.
 
         Args:
-            processed_data (pandas.DataFrame):
+            processed_data (pandas.DataFrame or pyspark.sql.DataFrame):
                 Data to be learned.
         """
+        # GaussianNormalizer (RDT HyperTransformer) is pandas-only.
+        # Collect Spark DF to driver before normalization preprocessing.
+        # ponytail: collect is unavoidable — GaussianNormalizer fits per-column scipy distributions.
+        if is_spark_dataframe(processed_data):
+            processed_data = processed_data.toPandas()
+
         warn_missing_numerical_distributions(self.numerical_distributions, processed_data.columns)
         gaussian_normalizer_config = self._create_gaussian_normalizer_config(processed_data)
         self._gaussian_normalizer_hyper_transformer = rdt.HyperTransformer()
@@ -238,6 +252,7 @@ class CopulaGANSynthesizer(CTGANSynthesizer):
         """
         sampled = super()._sample(num_rows, conditions)
         return self._gaussian_normalizer_hyper_transformer.reverse_transform(sampled)
+
 
     def get_learned_distributions(self):
         """Get the marginal distributions used by the ``CTGANSynthesizer``.

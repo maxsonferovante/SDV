@@ -1,0 +1,11 @@
+.git
+.venv
+venv
+dataset_real
+__pycache__
+*.pyc
+.pytest_cache
+build
+dist
+*.egg-info
+uv.lock
